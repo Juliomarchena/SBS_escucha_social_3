@@ -1,11 +1,12 @@
 """
 =============================================================
-  MICROHELP — API Escucha Social SBS v4.0
+  MICROHELP — API Escucha Social SBS v4.2
   Arquitectura ligera: RSS → Claude (análisis directo)
 
   Flujo:
     1. RSS feeds peruanos  → obtiene noticias reales
     2. Claude API          → analiza sentimiento y riesgo
+    3. Claude Sonnet 4     → análisis consolidado de riesgo
 
   Sin BERT — funciona en cualquier servidor con poca RAM
   Autor: Julio Marchena · MICROHELP
@@ -29,9 +30,9 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_URL     = "https://api.anthropic.com/v1/messages"
 
 app = FastAPI(
-    title="API Escucha Social SBS v4.0",
+    title="API Escucha Social SBS v4.2",
     description="RSS Peruanos + Claude para análisis de sentimiento financiero",
-    version="4.0"
+    version="4.2"
 )
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -154,6 +155,21 @@ class ResultadoAnalisis(BaseModel):
     escaladas_claude: int
     noticias: list[NoticiaAnalizada]
 
+# ── Modelo para Análisis Consolidado ──────────────────────────────────────────
+class NoticiaResumen(BaseModel):
+    titulo: str
+    fuente: str
+    fecha: str
+    categoria: str
+    sentimiento: str
+    score_riesgo: int
+    razon_claude: str = ""
+
+class ConsolidadoRequest(BaseModel):
+    empresa: str
+    dias_ventana: int = 30
+    noticias: list[NoticiaResumen]
+
 # ═══════════════════════════════════════════════════════
 # CAPA 1 — RSS
 # ═══════════════════════════════════════════════════════
@@ -274,6 +290,120 @@ Responde en español. La razón debe ser ejecutiva y directa."""
 
 
 # ═══════════════════════════════════════════════════════
+# CAPA 3 — Claude Sonnet 4 (análisis consolidado)
+# ═══════════════════════════════════════════════════════
+SYSTEM_PROMPT_CONSOLIDADO = """Eres un analista sénior de riesgo reputacional del sistema financiero peruano.
+Tu rol es analizar el CONJUNTO de noticias ya clasificadas sobre una entidad financiera y generar un informe consolidado de riesgo.
+
+CONTEXTO:
+- Trabajas para la Superintendencia de Banca, Seguros y AFP del Perú (SBS)
+- Las noticias ya fueron clasificadas individualmente con sentimiento y score de riesgo
+- Tu trabajo es encontrar PATRONES, no repetir el análisis individual
+
+INSTRUCCIONES DE ANÁLISIS:
+
+1. PATRONES: Identifica temas recurrentes. ¿Se repiten sanciones? ¿Hay escalamiento de un problema? ¿Hay correlaciones entre eventos?
+   Ejemplo: múltiples sanciones de Indecopi + salida de directivos = señal compuesta de crisis de gobernanza.
+
+2. DIMENSIONES DE RIESGO: Agrupa hallazgos en estas dimensiones:
+   - REGULATORIO: Sanciones, multas, incumplimientos normativos
+   - GOBERNANZA: Cambios directivos, estructura organizacional
+   - FINANCIERO: Indicadores económicos, solidez, liquidez
+   - REPUTACIONAL: Percepción pública, imagen de marca
+   - OPERATIVO: Fallas en servicio, quejas sistemáticas
+
+3. NIVEL DE RIESGO POR DIMENSIÓN:
+   - CRITICO: Múltiples eventos negativos graves, patrón claro
+   - ALTO: Eventos negativos significativos con potencial de escalamiento
+   - MEDIO: Señales de alerta que requieren monitoreo
+   - BAJO: Sin indicadores negativos relevantes
+   - POSITIVO: Indicadores favorables que fortalecen la posición
+
+4. CORRELACIONES: Busca conexiones entre noticias que no son evidentes individualmente.
+
+FORMATO DE RESPUESTA (responde SOLO en JSON válido, sin markdown, sin backticks, sin texto adicional):
+{
+  "entidad": "nombre",
+  "periodo": "descripción del periodo",
+  "total_noticias": número,
+  "distribucion_sentimiento": {"positivo": n, "negativo": n, "neutral": n},
+  "score_riesgo_promedio": número,
+  "score_riesgo_maximo": número,
+  "dimensiones": [
+    {"nombre": "REGULATORIO|GOBERNANZA|FINANCIERO|REPUTACIONAL|OPERATIVO", "nivel": "CRITICO|ALTO|MEDIO|BAJO|POSITIVO", "hallazgos": "texto", "noticias_relacionadas": [índices]}
+  ],
+  "patrones_detectados": [
+    {"patron": "texto", "evidencia": "texto", "implicancia": "texto"}
+  ],
+  "correlaciones": [
+    {"eventos": "texto", "interpretacion": "texto"}
+  ],
+  "conclusion_ejecutiva": "párrafo de 3-5 líneas",
+  "nivel_riesgo_global": "CRITICO|ALTO|MEDIO|BAJO",
+  "recomendaciones": ["acción 1", "acción 2", "acción 3"]
+}
+
+REGLAS:
+- Responde SOLO con el JSON, sin texto adicional
+- Sé específico y basado en evidencia
+- Si no hay suficientes noticias para un patrón, indica "Datos insuficientes para detectar patrones"
+- El nivel global debe reflejar la dimensión más crítica
+- Las recomendaciones deben ser accionables para un supervisor SBS
+- Solo incluye dimensiones donde haya evidencia (no inventes dimensiones vacías)"""
+
+
+def ejecutar_analisis_consolidado(empresa: str, dias_ventana: int, noticias: list[NoticiaResumen]) -> dict:
+    """Llama a Claude Sonnet 4 con todas las noticias para análisis de patrones."""
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(500, "ANTHROPIC_API_KEY no configurada")
+
+    # Construir prompt de usuario con las noticias
+    resumen = "\n".join(
+        f"[{i+1}] Fecha: {n.fecha} | Fuente: {n.fuente} | Categoría: {n.categoria} | "
+        f"Sentimiento: {n.sentimiento} | Score: {n.score_riesgo} | "
+        f"Título: {n.titulo} | Razón: {n.razon_claude or 'N/A'}"
+        for i, n in enumerate(noticias)
+    )
+    user_prompt = (
+        f'Analiza las siguientes {len(noticias)} noticias sobre "{empresa}" '
+        f'de los últimos {dias_ventana} días:\n\n{resumen}'
+    )
+
+    print(f"\n[CONSOLIDADO] {empresa}: {len(noticias)} noticias → Claude Sonnet 4")
+
+    try:
+        resp = requests.post(ANTHROPIC_URL, headers={
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }, json={
+            "model": "claude-sonnet-4-20250514",
+            "max_tokens": 4096,
+            "system": SYSTEM_PROMPT_CONSOLIDADO,
+            "messages": [{"role": "user", "content": user_prompt}],
+        }, timeout=60)
+
+        if resp.status_code != 200:
+            print(f"[CONSOLIDADO] Error API: {resp.status_code} {resp.text[:200]}")
+            raise HTTPException(resp.status_code, f"Error Claude API: {resp.status_code}")
+
+        texto = resp.json()["content"][0]["text"].strip()
+        texto_limpio = texto.replace("```json", "").replace("```", "").strip()
+        resultado = json.loads(texto_limpio)
+        print(f"[CONSOLIDADO] ✅ Nivel global: {resultado.get('nivel_riesgo_global', '?')}")
+        return resultado
+
+    except json.JSONDecodeError as e:
+        print(f"[CONSOLIDADO] Error parsing JSON: {str(e)[:100]}")
+        raise HTTPException(500, f"Error al parsear respuesta de Claude: {str(e)[:100]}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[CONSOLIDADO] Error: {str(e)[:100]}")
+        raise HTTPException(500, f"Error en análisis consolidado: {str(e)[:100]}")
+
+
+# ═══════════════════════════════════════════════════════
 # PIPELINE
 # ═══════════════════════════════════════════════════════
 def analizar_articulo(art: dict, terminos: list, ventana: int, empresa: str) -> NoticiaAnalizada:
@@ -351,6 +481,14 @@ def obtener_analisis(empresa: str, max_art: int, ventana: int) -> ResultadoAnali
 def analizar_empresa(req: EmpresaRequest):
     return obtener_analisis(req.empresa, req.max_articulos, req.ventana_contexto)
 
+@app.post("/analisis-consolidado")
+def analisis_consolidado(req: ConsolidadoRequest):
+    """Endpoint para análisis consolidado de riesgo.
+    Recibe las noticias ya analizadas y genera diagnóstico ejecutivo con Claude Sonnet 4."""
+    if len(req.noticias) == 0:
+        raise HTTPException(400, "Se requiere al menos una noticia para el análisis consolidado")
+    return ejecutar_analisis_consolidado(req.empresa, req.dias_ventana, req.noticias)
+
 @app.get("/exportar-negativas/{empresa}")
 def exportar_negativas(empresa: str):
     r = obtener_analisis(empresa, 30, 300)
@@ -385,12 +523,13 @@ def listar_empresas():
 @app.get("/health")
 def health():
     return {
-        "status": "ok", "version": "4.0", "arquitectura": "ligera",
+        "status": "ok", "version": "4.2", "arquitectura": "ligera",
         "capa_1": "RSS feeds peruanos (sin API key)",
-        "capa_2": "Claude API (analiza todas las noticias)",
+        "capa_2": "Claude Haiku (analiza todas las noticias)",
+        "capa_3": "Claude Sonnet 4 (análisis consolidado de riesgo)",
         "claude_disponible": bool(ANTHROPIC_API_KEY),
     }
 
 @app.get("/")
 def root():
-    return {"mensaje": "SBS Escucha Social v4.0 ✅ — RSS → Claude (sin BERT)"}
+    return {"mensaje": "SBS Escucha Social v4.2 ✅ — RSS → Claude Haiku + Sonnet 4 (análisis consolidado)"}
